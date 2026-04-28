@@ -1,6 +1,8 @@
+import hashlib
 import time
 import typing
 from dataclasses import dataclass
+from random import Random
 
 import bittensor as bt
 from CliqueAI.graph.codec import GraphCodec
@@ -12,6 +14,11 @@ SEARCH_MARGIN_SECONDS = 4.0
 DEFAULT_SEARCH_SECONDS = 5.5
 MAX_SEARCH_SECONDS = 6.5
 EXACT_SEARCH_NODE_LIMIT = 220
+BRON_KERBOSCH_NODE_LIMIT = 90
+RANDOM_PICK_POOL = 10
+LARGE_GRAPH_DETERMINISTIC_FRACTION = 0.30
+THERMAL_MIN_DROP = 1
+THERMAL_MAX_DROP = 14
 
 
 def _iter_bits(mask: int):
@@ -33,10 +40,6 @@ def _build_neighbor_masks(
                 mask |= 1 << neighbor
         masks[vertex] = mask
     return masks
-
-
-def _mask_to_sorted_list(mask: int) -> list[int]:
-    return sorted(_iter_bits(mask))
 
 
 def _extend_to_maximal_clique(clique: list[int], neighbor_masks: list[int]) -> list[int]:
@@ -87,6 +90,36 @@ def _greedy_clique(
     return clique
 
 
+def _randomized_greedy_clique(
+    candidates: int,
+    neighbor_masks: list[int],
+    degrees: list[int],
+    rng: Random,
+    deadline: float,
+) -> list[int]:
+    clique: list[int] = []
+
+    while candidates and time.monotonic() < deadline:
+        vertices = list(_iter_bits(candidates))
+        if not vertices:
+            break
+
+        vertices.sort(
+            key=lambda vertex: (
+                (candidates & neighbor_masks[vertex]).bit_count(),
+                degrees[vertex],
+                rng.random(),
+            ),
+            reverse=True,
+        )
+        pick_pool_size = min(len(vertices), RANDOM_PICK_POOL)
+        vertex = vertices[int(rng.random() * pick_pool_size)]
+        clique.append(vertex)
+        candidates &= neighbor_masks[vertex]
+
+    return clique
+
+
 def _repair_clique(clique: list[int], neighbor_masks: list[int]) -> list[int]:
     repaired: list[int] = []
     candidate_mask = (1 << len(neighbor_masks)) - 1
@@ -96,6 +129,130 @@ def _repair_clique(clique: list[int], neighbor_masks: list[int]) -> list[int]:
             repaired.append(vertex)
             candidate_mask &= neighbor_masks[vertex]
     return _extend_to_maximal_clique(repaired, neighbor_masks)
+
+
+def _common_neighbors(clique: list[int], all_vertices: int, neighbor_masks: list[int]) -> int:
+    candidates = all_vertices
+    for vertex in clique:
+        candidates &= neighbor_masks[vertex]
+    return candidates
+
+
+def _rebuild_from_partial_clique(
+    clique: list[int],
+    all_vertices: int,
+    neighbor_masks: list[int],
+    degrees: list[int],
+    rng: Random,
+    deadline: float,
+) -> list[int]:
+    if len(clique) <= 1 or time.monotonic() >= deadline:
+        return clique
+
+    best = clique
+    ordered_removals = sorted(
+        clique,
+        key=lambda vertex: (degrees[vertex], rng.random()),
+    )
+
+    for removed in ordered_removals[: min(len(ordered_removals), THERMAL_MAX_DROP)]:
+        if time.monotonic() >= deadline:
+            break
+
+        partial = [vertex for vertex in clique if vertex != removed]
+        candidates = _common_neighbors(partial, all_vertices, neighbor_masks)
+        for vertex in partial:
+            candidates &= ~(1 << vertex)
+
+        rebuilt = partial + _randomized_greedy_clique(
+            candidates,
+            neighbor_masks,
+            degrees,
+            rng,
+            deadline,
+        )
+        rebuilt = _repair_clique(rebuilt, neighbor_masks)
+        if len(rebuilt) > len(best):
+            best = rebuilt
+            bt.logging.info(f"Rebuilt clique size: {len(best)}")
+
+    return best
+
+
+def _thermal_cycling_clique(
+    seed_clique: list[int],
+    all_vertices: int,
+    neighbor_masks: list[int],
+    degrees: list[int],
+    rng: Random,
+    deadline: float,
+) -> list[int]:
+    if time.monotonic() >= deadline:
+        return seed_clique
+
+    best = _repair_clique(seed_clique, neighbor_masks) if seed_clique else []
+    current = best
+    cycle = 0
+
+    while time.monotonic() < deadline:
+        if current:
+            heat = max(THERMAL_MIN_DROP, min(THERMAL_MAX_DROP, 1 + cycle // 8))
+            drop_count = min(len(current), heat)
+            removals = sorted(
+                current,
+                key=lambda vertex: (degrees[vertex], rng.random()),
+            )[:drop_count]
+            partial = [vertex for vertex in current if vertex not in set(removals)]
+            candidates = _common_neighbors(partial, all_vertices, neighbor_masks)
+            for vertex in partial:
+                candidates &= ~(1 << vertex)
+        else:
+            partial = []
+            candidates = all_vertices
+
+        quenched = partial + _randomized_greedy_clique(
+            candidates,
+            neighbor_masks,
+            degrees,
+            rng,
+            deadline,
+        )
+        quenched = _repair_clique(quenched, neighbor_masks)
+        quenched = _rebuild_from_partial_clique(
+            quenched,
+            all_vertices,
+            neighbor_masks,
+            degrees,
+            rng,
+            deadline,
+        )
+
+        if len(quenched) >= len(current) or rng.random() < 0.08:
+            current = quenched
+        if len(quenched) > len(best):
+            best = quenched
+            bt.logging.info(f"Thermal cycling clique size: {len(best)}")
+
+        if cycle % 5 == 4:
+            fresh = _repair_clique(
+                _randomized_greedy_clique(
+                    all_vertices,
+                    neighbor_masks,
+                    degrees,
+                    rng,
+                    deadline,
+                ),
+                neighbor_masks,
+            )
+            if len(fresh) > len(best):
+                best = fresh
+                bt.logging.info(f"Thermal restart clique size: {len(best)}")
+            if len(fresh) >= len(current):
+                current = fresh
+
+        cycle += 1
+
+    return best
 
 
 @dataclass
@@ -183,11 +340,58 @@ def _expand_max_clique(
         candidates &= ~bit
 
 
+def _bron_kerbosch_maximal_cliques(
+    current: list[int],
+    candidates: int,
+    excluded: int,
+    state: CliqueSearchState,
+) -> None:
+    if not state.has_time():
+        return
+
+    if not candidates and not excluded:
+        state.update_best(current)
+        return
+
+    pivot_pool = candidates | excluded
+    if pivot_pool:
+        pivot = max(
+            _iter_bits(pivot_pool),
+            key=lambda vertex: (candidates & state.neighbor_masks[vertex]).bit_count(),
+        )
+        vertices_to_expand = candidates & ~state.neighbor_masks[pivot]
+    else:
+        vertices_to_expand = candidates
+
+    while vertices_to_expand:
+        if not state.has_time():
+            return
+        if len(current) + candidates.bit_count() <= len(state.best):
+            return
+
+        bit = vertices_to_expand & -vertices_to_expand
+        vertex = bit.bit_length() - 1
+        current.append(vertex)
+        _bron_kerbosch_maximal_cliques(
+            current,
+            candidates & state.neighbor_masks[vertex],
+            excluded & state.neighbor_masks[vertex],
+            state,
+        )
+        current.pop()
+
+        candidates &= ~bit
+        excluded |= bit
+        vertices_to_expand &= ~bit
+
+
 def _seed_with_greedy_search(
     all_vertices: int,
     neighbor_masks: list[int],
     degrees: list[int],
     deadline: float,
+    deterministic_deadline: float,
+    rng: Random,
 ) -> list[int]:
     ordered_vertices = sorted(
         range(len(neighbor_masks)),
@@ -198,7 +402,7 @@ def _seed_with_greedy_search(
     attempt = 0
     max_attempts = max(len(neighbor_masks) * 2, 128)
 
-    while attempt < max_attempts and time.monotonic() < deadline:
+    while attempt < max_attempts and time.monotonic() < deterministic_deadline:
         if attempt < len(ordered_vertices):
             first = ordered_vertices[attempt]
         else:
@@ -218,6 +422,28 @@ def _seed_with_greedy_search(
 
         attempt += 1
 
+    while time.monotonic() < deadline:
+        clique = _randomized_greedy_clique(
+            all_vertices,
+            neighbor_masks,
+            degrees,
+            rng,
+            deadline,
+        )
+        clique = _repair_clique(clique, neighbor_masks)
+        clique = _thermal_cycling_clique(
+            clique,
+            all_vertices,
+            neighbor_masks,
+            degrees,
+            rng,
+            deadline,
+        )
+
+        if len(clique) > len(best):
+            best = clique
+            bt.logging.info(f"Randomized seed clique size: {len(best)}")
+
     return best
 
 
@@ -225,6 +451,7 @@ def solve_maximal_clique(
     number_of_nodes: int,
     adjacency_list: list[list[int]],
     timeout: float | None = None,
+    seed: int | None = None,
 ) -> list[int]:
     if number_of_nodes <= 0:
         return []
@@ -246,18 +473,36 @@ def solve_maximal_clique(
     neighbor_masks = _build_neighbor_masks(number_of_nodes, adjacency_list)
     degrees = [mask.bit_count() for mask in neighbor_masks]
     all_vertices = (1 << number_of_nodes) - 1
+    rng = Random(seed if seed is not None else time.time_ns())
 
     if number_of_nodes <= EXACT_SEARCH_NODE_LIMIT:
         seed_deadline = min(deadline, start + max(0.2, budget * 0.25))
+        deterministic_deadline = seed_deadline
     else:
         seed_deadline = deadline
+        deterministic_deadline = min(
+            deadline,
+            start + max(0.35, budget * LARGE_GRAPH_DETERMINISTIC_FRACTION),
+        )
 
     best = _seed_with_greedy_search(
         all_vertices=all_vertices,
         neighbor_masks=neighbor_masks,
         degrees=degrees,
         deadline=seed_deadline,
+        deterministic_deadline=deterministic_deadline,
+        rng=rng,
     )
+
+    if number_of_nodes <= BRON_KERBOSCH_NODE_LIMIT and time.monotonic() < deadline:
+        search_state = CliqueSearchState(
+            deadline=min(deadline, time.monotonic() + max(0.1, budget * 0.15)),
+            neighbor_masks=neighbor_masks,
+            degrees=degrees,
+            best=best,
+        )
+        _bron_kerbosch_maximal_cliques([], all_vertices, 0, search_state)
+        best = search_state.best
 
     if number_of_nodes <= EXACT_SEARCH_NODE_LIMIT and time.monotonic() < deadline:
         search_state = CliqueSearchState(
@@ -273,7 +518,7 @@ def solve_maximal_clique(
         best_vertex = max(range(number_of_nodes), key=lambda v: degrees[v])
         best = _extend_to_maximal_clique([best_vertex], neighbor_masks)
 
-    return _mask_to_sorted_list(sum(1 << vertex for vertex in _repair_clique(best, neighbor_masks)))
+    return _repair_clique(best, neighbor_masks)
 
 
 class Miner(BaseMinerNeuron):
@@ -305,6 +550,7 @@ class Miner(BaseMinerNeuron):
                 number_of_nodes=synapse.number_of_nodes,
                 adjacency_list=adjacency_list,
                 timeout=getattr(synapse, "timeout", None),
+                seed=self._request_seed(synapse),
             )
         except Exception as exc:
             bt.logging.error(f"Failed to solve clique request {synapse.uuid}: {exc}")
@@ -325,6 +571,17 @@ class Miner(BaseMinerNeuron):
 
     async def priority_graph(self, synapse: MaximumCliqueOfLambdaGraph) -> float:
         return await self.priority(synapse)
+
+    def _request_seed(self, synapse: MaximumCliqueOfLambdaGraph) -> int:
+        seed_material = (
+            f"{synapse.uuid}:"
+            f"{getattr(self.wallet.hotkey, 'ss58_address', '')}:"
+            f"{time.time_ns()}"
+        )
+        return int.from_bytes(
+            hashlib.blake2b(seed_material.encode("utf-8"), digest_size=8).digest(),
+            "big",
+        )
 
 
 if __name__ == "__main__":
